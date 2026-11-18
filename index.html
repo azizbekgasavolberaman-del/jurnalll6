@@ -1455,11 +1455,139 @@
 
     function isoOfDate(dt) { return dt.getFullYear() + '-' + String(dt.getMonth()+1).padStart(2,'0') + '-' + String(dt.getDate()).padStart(2,'0'); }
     function dateIsoToLabel(iso) { const d = new Date(iso + 'T00:00:00'); if (isNaN(d.getTime())) return iso; return `${d.getDate()}-${mon[d.getMonth()]}`; }
+
+    // Jadval sanasi o'zgarganda faqat ko'chirilgan darsning baholarini
+    // eski sana kalitidan yangi sana kalitiga ko'chiradi.
+    function migrateChangedLessonMarks(q, cls, sub, oldDates, newDates) {
+        const isoOf = x => {
+            if (!x) return '';
+            if (x.iso) return x.iso;
+            const m = String(x.date || '').match(/^(\d{1,2})-([A-Za-zА-Яа-яЁё]+)$/);
+            if (!m) return '';
+            const mi = mon.findIndex(v => String(v).toLowerCase() === m[2].toLowerCase());
+            if (mi < 0) return '';
+            const qs = getQuarters().find(z => z.id === q);
+            let year = qs && qs.start ? Number(qs.start.slice(0,4)) : new Date().getFullYear();
+            const month = mi + 1;
+            if (qs && qs.end && Number(qs.end.slice(0,4)) !== year && month < 8) year = Number(qs.end.slice(0,4));
+            return `${year}-${String(month).padStart(2,'0')}-${String(Number(m[1])).padStart(2,'0')}`;
+        };
+        const norm = arr => (arr || []).map(x => ({
+            iso: isoOf(x),
+            date: x.date || (x.iso ? dateIsoToLabel(x.iso) : ''),
+            instance: Number(x.instance) || 0
+        })).filter(x => x.iso);
+        const oldA = norm(oldDates), newA = norm(newDates);
+        const id = x => `${x.iso}#${x.instance}`;
+        const newIds = new Set(newA.map(id)), oldIds = new Set(oldA.map(id));
+        const removed = oldA.filter(x => !newIds.has(id(x))).sort((a,b)=>a.iso.localeCompare(b.iso) || a.instance-b.instance);
+        const added = newA.filter(x => !oldIds.has(id(x))).sort((a,b)=>a.iso.localeCompare(b.iso) || a.instance-b.instance);
+        if (!removed.length || !added.length) return;
+        const pairs = [];
+        const used = new Set();
+        removed.forEach(oldD => {
+            // O'zgargan darsni sanasi eng yaqin yangi dars sanasiga bog'laymiz.
+            let best = -1, dist = Infinity;
+            added.forEach((newD, i) => {
+                if (used.has(i) || oldD.instance !== newD.instance) return;
+                const dd = Math.abs(new Date(oldD.iso+'T00:00:00') - new Date(newD.iso+'T00:00:00'));
+                if (dd < dist) { dist = dd; best = i; }
+            });
+            if (best >= 0) { used.add(best); pairs.push([oldD, added[best]]); }
+        });
+        if (!pairs.length) return;
+
+        // Dars turi ustun indeksi bo'yicha saqlanadi. Jadval sanalari
+        // o'zgarganda turlarni eski sanadan yangi sanaga (va o'zgarmagan
+        // sanalarning yangi indekslariga) qayta joylaymiz.
+        const movedByOldId = new Map(pairs.map(([from, to]) => [id(from), id(to)]));
+        const newIndexById = new Map(newA.map((d, i) => [id(d), i]));
+        const typeSnapshots = [];
+        oldA.forEach((oldD, oldIdx) => {
+            const targetId = movedByOldId.get(id(oldD)) || id(oldD);
+            const newIdx = newIndexById.get(targetId);
+            if (newIdx === undefined) return;
+            const typesForDate = getLessonTypesForColumn(cls, sub, q, oldIdx);
+            if (typesForDate.length) typeSnapshots.push({ newIdx, types: typesForDate });
+        });
+        const maxTypeIndex = Math.max(oldA.length, newA.length);
+        for (let i = 0; i < maxTypeIndex; i++) {
+            const typeKey = `lesson_types_${cls}_${sub}_${q}_d_${i}`;
+            localStorage.removeItem(typeKey);
+            window.syncToFirebase(typeKey, null);
+        }
+        typeSnapshots.forEach(item => setLessonTypesForColumn(cls, sub, q, item.newIdx, item.types));
+
+        const marks = getMarks(q, cls, sub);
+        let changed = false;
+        Object.keys(marks).forEach(studentKey => {
+            if (studentKey.startsWith('__')) return;
+            const row = marks[studentKey];
+            if (!row || typeof row !== 'object') return;
+            pairs.forEach(([from,to]) => {
+                const fromKey = `${dateIsoToLabel(from.iso)}_${from.instance}`;
+                const toKey = `${dateIsoToLabel(to.iso)}_${to.instance}`;
+                Object.keys(row).filter(k => k === fromKey || k.startsWith(fromKey + '__lt_')).forEach(oldKey => {
+                    const suffix = oldKey.slice(fromKey.length);
+                    const newKey = toKey + suffix;
+                    if (row[oldKey] !== '' && row[oldKey] != null && row[newKey] == null) {
+                        row[newKey] = row[oldKey];
+                        delete row[oldKey];
+                        changed = true;
+                    }
+                });
+            });
+            if (!Object.keys(row).length) delete marks[studentKey];
+        });
+        if (changed) saveMarksObj(q, cls, sub, marks);
+
+        // Xuddi shu o'zgargan darsning mavzu, uy vazifasi va izohini ham
+        // umumiy reja hamda barcha guruhlar rejalarida yangi sanaga ko'chiramiz.
+        const groups = lsGet(`groups_${cls}_${sub}`, []) || [];
+        const planKeys = [`plans_${q}_${cls}_${sub}`];
+        groups.forEach((g, i) => planKeys.push(getGroupPlanKey(q, cls, sub, i)));
+        planKeys.forEach(planKey => {
+            const plans = lsGet(planKey, {}) || {};
+            let planChanged = false;
+            pairs.forEach(([from, to]) => {
+                const fromKey = `${dateIsoToLabel(from.iso)}_${from.instance}`;
+                const toKey = `${dateIsoToLabel(to.iso)}_${to.instance}`;
+                const oldPlan = plans[fromKey];
+                if (!oldPlan || typeof oldPlan !== 'object') return;
+                const hasContent = ['topic', 'hw', 'note'].some(field =>
+                    oldPlan[field] != null && String(oldPlan[field]).trim() !== ''
+                );
+                if (!hasContent) return;
+                if (!plans[toKey] || typeof plans[toKey] !== 'object') plans[toKey] = {};
+                ['topic', 'hw', 'note'].forEach(field => {
+                    const oldValue = oldPlan[field];
+                    const newValue = plans[toKey][field];
+                    if (oldValue != null && String(oldValue).trim() !== '' &&
+                        (newValue == null || String(newValue).trim() === '')) {
+                        plans[toKey][field] = oldValue;
+                    }
+                });
+                // Manba sana yozuvini olib tashlaymiz: ma'lumot faqat yangi sanada qoladi.
+                delete plans[fromKey];
+                planChanged = true;
+            });
+            if (planChanged) {
+                plans.__ts = Date.now();
+                lsSet(planKey, plans);
+                if (window.savePlanToFirebase) window.savePlanToFirebase(planKey, plans);
+                else window.syncToFirebase(planKey, plans);
+            }
+        });
+    }
+
     function getCustomDates(cls, sub, q) { const arr = lsGet(`custom_dates_${cls}_${sub}_${q}`, null); return (Array.isArray(arr) && arr.length) ? arr : null; }
     function persistCustomDates(cls, sub, q, arr) {
         const key = `custom_dates_${cls}_${sub}_${q}`;
+        const oldDates = getCustomDates(cls, sub, q) || buildAutoCustomDates(cls, sub, q);
         if (!arr || arr.length === 0) { localStorage.removeItem(key); window.syncToFirebase(key, null); }
         else { lsSet(key, arr); window.syncToFirebase(key, arr); }
+        const newDates = getCustomDates(cls, sub, q) || buildAutoCustomDates(cls, sub, q);
+        migrateChangedLessonMarks(q, cls, sub, oldDates, newDates);
     }
     function removeCustomDates(cls, sub, q) {
         const key = `custom_dates_${cls}_${sub}_${q}`;
@@ -3007,6 +3135,32 @@
         const checkboxes = document.querySelectorAll('#lt-checkbox-list input[type="checkbox"]');
         const selected = [];
         checkboxes.forEach(cb => { if (cb.checked) selected.push(cb.value); });
+        // Agar baho dars turi tanlanishidan OLDIN kiritilgan bo'lsa,
+        // uni yo'qotmasdan tanlangan birinchi (afzal bo'lsa primary) turga biriktiramiz.
+        // Shunda ustunlar dars turi bo'yicha ajratilganda ham eski baho ko'rinib turadi.
+        const dates = generateDates(cls, sub, q);
+        const lessonDate = dates[dIdx];
+        if (lessonDate && selected.length) {
+            const baseKey = dateKey(lessonDate);
+            const marks = getMarks(q, cls, sub);
+            const lessonDefs = getLessonTypes();
+            const primary = selected.find(code => lessonDefs.some(t => t.short === code && t.primary));
+            const targetType = primary || selected[0];
+            const targetKey = baseKey + '__lt_' + targetType;
+            let marksChanged = false;
+            Object.keys(marks).forEach(studentKey => {
+                if (studentKey.startsWith('__')) return;
+                const row = marks[studentKey];
+                if (!row || typeof row !== 'object') return;
+                const oldGrade = row[baseKey];
+                if (oldGrade != null && String(oldGrade).trim() !== '' && row[targetKey] == null) {
+                    row[targetKey] = oldGrade;
+                    delete row[baseKey];
+                    marksChanged = true;
+                }
+            });
+            if (marksChanged) saveMarksObj(q, cls, sub, marks);
+        }
         setLessonTypesForColumn(cls, sub, q, dIdx, selected);
         document.getElementById('lt-manager-modal').remove();
         render(); showSaved();
@@ -3628,10 +3782,20 @@
         }
     };
     window.updateClassSubjectDays = function(cls, idx, valStr) {
-        const days = valStr.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
+        const days = valStr.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n) && n >= 0 && n <= 6);
         const classSubs = getClassSubjectsRaw(cls);
         if (classSubs[idx]) {
+            const sub = classSubs[idx].name;
+            const quarterDates = getQuarters().map(q => ({
+                id: q.id,
+                oldDates: getCustomDates(cls, sub, q.id) || buildAutoCustomDates(cls, sub, q.id)
+            }));
             classSubs[idx].days = days;
+            quarterDates.forEach(qd => {
+                // Har bir chorakda faqat jadvaldan chiqarilgan sana va uning yangi sanasi bog'lanadi.
+                const newDates = getCustomDates(cls, sub, qd.id) || buildAutoCustomDates(cls, sub, qd.id);
+                migrateChangedLessonMarks(qd.id, cls, sub, qd.oldDates, newDates);
+            });
             lsSet(`class_subs_${cls}`, classSubs);
             window.syncClassSubsToFirebase(cls, classSubs);
             render();
